@@ -28,6 +28,10 @@
 - **幂等提交**：相同输入 + 策略 + 遮挡规则在**同一 `ANON_SECRET` 作用域下**
   的重复提交返回同一作业（HTTP 200）；轮换密钥后重提会创建独立作业，
   绝不会把旧密钥的结果当作新密钥的结果返回。
+- **中断恢复（崩溃安全）**：输入 ZIP 落盘后才登记作业；执行者持有数据库**租约**
+  并按期续约。进程崩溃后，无论重启容器还是原样重提，遗留作业都会以**原
+  `job_id`** 被接管重跑（跨进程原子裁决，活跃执行者不会被抢占）；结果 ZIP 先写
+  临时文件再原子更名、落盘后才标记 `done`，绝不暴露半成品或误标完成。
 - **密钥作用域（轮换安全）**：判重 ID 与持久化判重条件都带密钥**指纹**
   （SHA-256 截断，非可逆，不保存明文密钥）。旧密钥作业仍可用原 ID 查询下载，
   新密钥产出独立作业 ID、审计与哈希；升级前的无指纹旧记录自动迁移且永不被复用。
@@ -44,8 +48,9 @@ docker compose up --build
 - 健康检查：`GET /healthz`
 - 策略说明：`GET /policies`
 
-作业数据库与结果 ZIP 持久化在命名卷 `dicom-anon-data`（容器内 `/data`），
-重启容器不会丢失历史作业。
+作业数据库、持久化输入与结果 ZIP 保存在命名卷 `dicom-anon-data`（容器内
+`/data`），重启容器不会丢失历史作业；**崩溃时未完成的作业会在重启后自动以原
+`job_id` 恢复执行**（见下文[「中断恢复」](#中断恢复崩溃安全)）。
 
 > 生产部署请设置稳定的 `ANON_SECRET`（环境变量或 `.env` 文件），
 > 它是 UID 映射 / 日期偏移 / 哈希的 HMAC 根密钥；变更后映射结果会改变。
@@ -58,7 +63,7 @@ docker compose up --build
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-pytest tests/ -q          # 36 项测试
+pytest tests/ -q          # 52 项测试
 ```
 
 ## 示例请求
@@ -190,7 +195,7 @@ assert str(leaf.ReferencedSOPSequence[0].ReferencedSOPInstanceUID).startswith("2
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/jobs` | 提交作业（multipart：`file` ZIP、`policy` JSON 字符串、`redactions` 可选 JSON 数组）。幂等：相同输入在同一 `ANON_SECRET` 作用域内返回既有作业 |
+| `POST` | `/jobs` | 提交作业（multipart：`file` ZIP、`policy` JSON 字符串、`redactions` 可选 JSON 数组）。幂等：相同输入在同一 `ANON_SECRET` 作用域内返回既有作业；若既有作业因进程中断停在 `queued`/`processing` 且无活跃执行者，本次提交会以原 ID 接管恢复 |
 | `GET` | `/jobs/{id}` | 查询状态 / 逐项错误 / 审计摘要 / 结果哈希（跨密钥轮换，旧 ID 仍可查） |
 | `GET` | `/jobs/{id}/download` | 下载匿名化结果 ZIP（未完成返回 409；结果文件已被删除返回 410） |
 | `GET` | `/policies` | 支持的策略版本、默认档案、遮挡框格式 |
@@ -280,6 +285,103 @@ curl -s http://localhost:8000/jobs/218b2ae74856eadbd34f8504f8e4521f/download \
 # be0c34e6278075de3a1afd598e16b0696d0e0076d885ae20bd79b3db55781707  -
 ```
 
+## 中断恢复（崩溃安全）
+
+旧行为：作业登记为 `queued` 后，输入 ZIP 只存在于内存中的后台任务里；
+进程在任务完成前退出，作业便永远停在 `queued`/`processing`——原样重提只会
+判重返回 200，却没有任何执行者再跑它。
+
+现在的机制（全部基于 `DATA_DIR` 内的持久化状态，跨进程安全）：
+
+1. **输入落盘**：登记作业前，上传的 ZIP 先原子写入
+   `DATA_DIR/inputs/{job_id}.zip`（临时文件 + `os.replace`），崩溃后输入仍可恢复。
+2. **执行租约**：执行者持有作业行的租约（`lease_owner` = 主机/PID/随机串，
+   `lease_expires_at` 至多 `LEASE_TTL_SECONDS` 秒，默认 30），运行期间按
+   TTL/3 间隔续约。**租约是否过期/停滞即"旧任务是否仍在执行"的判据。**
+3. **原子裁决接管**：接管是单条 `UPDATE ... WHERE 租约已过期`（或启动时
+   `WHERE 租约等于启动快照` 的 CAS），SQLite 写串行化保证并发下只有一个
+   接管者成功；活跃执行者的租约被续约推进，永远不会被抢占。被取代的执行者
+   续约/状态推进会因租约不匹配而失效，不会改写记录。
+4. **与记录一致的输入**：接管者执行时，策略与遮挡规则取自数据库记录，
+   ZIP 字节（重提请求体或持久化输入）必须哈希等于记录的 `input_sha256`，
+   否则作业以 `INPUT_UNAVAILABLE` 失败（不会拿错输入产出结果）。
+5. **原子结果发布**：结果先写临时文件、`fsync`、`os.replace` 到
+   `results/{job_id}.zip`，**落盘完成后**才置 `done`；崩溃只会留下下次启动时
+   被清理的临时文件，下载接口永远拿不到半成品，作业也不会被误标 `done`。
+
+触发恢复的两条路径：
+
+- **重提恢复**：`POST /jobs` 判重命中且作业未完成时，当前进程尝试接管；
+  成功则以原 `job_id` 重新执行（响应仍为 HTTP 200 复用语义）。
+- **启动恢复**：服务启动时接管租约已过期的作业；对"快速重启"场景
+  （旧租约尚未过期但永不再续约），启动 1.5×TTL 后按启动快照 CAS 接管。
+  因此 `docker compose up -d`（或 `restart`）后无需任何操作即可恢复。
+  启动恢复只接管**当前密钥指纹作用域**内的作业，轮换出去的旧密钥作业
+  不会被新密钥误跑。
+
+### 实操：Docker Compose 下复现一次中断恢复
+
+```bash
+docker compose up --build -d
+python scripts/make_sample.py
+curl -s -X POST http://localhost:8000/jobs \
+  -F "file=@sample_input.zip" \
+  -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+# {"job_id":"218b2ae74856eadbd34f8504f8e4521f","status":"queued", ...}
+
+# 在后台任务完成前模拟崩溃（真实部署中的容器宕机/被kill等价于此）
+docker compose kill -s SIGKILL api
+```
+
+此时作业停在 `queued`（或 `processing`），租约属于已死进程。重启：
+
+```bash
+docker compose up -d        # 同一数据卷、同一 ANON_SECRET
+```
+
+启动恢复会在租约过期后（默认最多约 1.5×TTL）自动以原 ID 重跑；也可以不等，
+在租约过期后**原样重提**同一份输入，立即触发接管（HTTP 200，同一 `job_id`）：
+
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:8000/jobs \
+  -F "file=@sample_input.zip" \
+  -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+# {"job_id":"218b2ae74856eadbd34f8504f8e4521f","status":"processing",
+#  "status_url":"/jobs/218b2ae74856eadbd34f8504f8e4521f",
+#  "detail":"identical submission already exists; returning the existing job"}
+# HTTP 200
+```
+
+恢复完成后查询/下载，结果与从未中断时逐字节一致（以下为实跑采集）：
+
+```bash
+curl -s http://localhost:8000/jobs/218b2ae74856eadbd34f8504f8e4521f
+```
+
+```json
+{
+  "job_id": "218b2ae74856eadbd34f8504f8e4521f",
+  "status": "done",
+  "result": {
+    "sha256": "be0c34e6278075de3a1afd598e16b0696d0e0076d885ae20bd79b3db55781707",
+    "size_bytes": 16029,
+    "download_url": "/jobs/218b2ae74856eadbd34f8504f8e4521f/download"
+  }
+}
+```
+
+```bash
+curl -s http://localhost:8000/jobs/218b2ae74856eadbd34f8504f8e4521f/download | sha256sum
+# be0c34e6278075de3a1afd598e16b0696d0e0076d885ae20bd79b3db55781707  -
+```
+
+> 调优：`LEASE_TTL_SECONDS`（默认 30）控制租约时长。崩溃后恢复的等待
+> 上界约为 1.5×TTL（启动接管）或 TTL（重提接管）；多副本共享同一
+> `DATA_DIR` 时该机制同样保证同一作业只有一个活跃执行者。
+
+
 ## 匿名化策略（版本化）
 
 ```json
@@ -354,6 +456,7 @@ curl -s http://localhost:8000/jobs/218b2ae74856eadbd34f8504f8e4521f/download \
 | `REDACTION_*` | 遮挡目标缺失 / 遮挡框越界 |
 | `POLICY_INVALID` / `POLICY_CONFLICT` | 策略结构非法 / 策略冲突 |
 | `NO_INSTANCES` | 包内无可用 DICOM 实例 |
+| `INPUT_UNAVAILABLE` | 中断恢复时持久化输入缺失或与记录的 `input_sha256` 不符，作业无法恢复 |
 
 ## 确定性说明
 

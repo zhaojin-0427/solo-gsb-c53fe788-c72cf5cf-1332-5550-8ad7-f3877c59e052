@@ -33,10 +33,17 @@ def secret_fingerprint(secret: str) -> str:
     return digest[:_FINGERPRINT_BYTES].hex()
 
 
+#: Default lease TTL (seconds) for job execution. An executor renews its lease
+#: at TTL/3 intervals; a lease that expired (or never moved for a full TTL
+#: after a restart) marks an interrupted job that may be taken over.
+DEFAULT_LEASE_TTL_SECONDS = 30.0
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: str
     secret: str
+    lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
 
     @property
     def secret_fp(self) -> str:
@@ -47,4 +54,7 @@ def get_settings() -> Settings:
     return Settings(
         data_dir=os.environ.get("DATA_DIR", "./data"),
         secret=os.environ.get("ANON_SECRET", DEFAULT_SECRET),
+        lease_ttl_seconds=float(
+            os.environ.get("LEASE_TTL_SECONDS", str(DEFAULT_LEASE_TTL_SECONDS))
+        ),
     )

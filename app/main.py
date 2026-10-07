@@ -4,6 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -12,8 +15,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from .config import Settings, get_settings
 from .models import JobCreated, JobStatus
 from .policy import SUPPORTED_POLICY_VERSIONS, canonical_json, default_profile_doc, policy_sha256
-from .store import JobStore
-from .worker import process_job
+from .store import RESUMABLE_STATUSES, JobStore
+from .worker import (
+    adopt_stale_jobs,
+    cleanup_stale_tmp_files,
+    new_owner_token,
+    process_job,
+    recover_claimed_record,
+    resume_interrupted_jobs,
+    snapshot_resumable_leases,
+    write_input_atomic,
+)
 
 DESCRIPTION = """\
 Anonymize multi-series DICOM ZIP archives for research use.
@@ -25,6 +37,8 @@ Anonymize multi-series DICOM ZIP archives for research use.
 * Itemized error reporting (missing references, illegal VRs, compressed
   pixels, policy conflicts) with all-or-nothing semantics
 * Audit summary with verifiable SHA-256 hashes
+* Crash-safe: interrupted jobs are recovered with their original id on
+  resubmission and at startup (lease-based cross-process arbitration)
 """
 
 
@@ -84,14 +98,54 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or get_settings()
     os.makedirs(settings.data_dir, exist_ok=True)
     results_dir = os.path.join(settings.data_dir, "results")
+    inputs_dir = os.path.join(settings.data_dir, "inputs")
     os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(inputs_dir, exist_ok=True)
     store = JobStore(os.path.join(settings.data_dir, "jobs.db"))
+    lease_ttl = settings.lease_ttl_seconds
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Crash recovery on boot: drop temp-file leftovers from interrupted
+        # atomic writes, then take over unfinished jobs of the current secret
+        # scope whose lease has already expired.
+        cleanup_stale_tmp_files(results_dir, inputs_dir)
+        resume_interrupted_jobs(
+            store, inputs_dir, results_dir, settings.secret, lease_ttl,
+            secret_fp=settings.secret_fp,
+        )
+        # Fast-restart case: a lease that has not expired yet but also never
+        # renews for a full TTL belongs to a dead process. Snapshot now, then
+        # CAS-take over whatever has not moved.
+        snapshot = snapshot_resumable_leases(store, secret_fp=settings.secret_fp)
+        if snapshot:
+            def _adopt() -> None:
+                time.sleep(lease_ttl * 1.5)
+                try:
+                    adopt_stale_jobs(
+                        store, inputs_dir, results_dir, settings.secret, lease_ttl,
+                        snapshot, secret_fp=settings.secret_fp,
+                    )
+                except Exception:
+                    pass  # recovery is best-effort; resubmission can always retry
+
+            threading.Thread(target=_adopt, name="job-adoption", daemon=True).start()
+        yield
 
     app = FastAPI(
         title="DICOM Research Data Anonymization API",
         version="1.0.0",
         description=DESCRIPTION,
+        lifespan=lifespan,
     )
+
+    def schedule(job_id: str, owner: str, zip_bytes: bytes, policy_obj: dict,
+                 redactions_obj: Optional[list], background_tasks: BackgroundTasks) -> None:
+        background_tasks.add_task(
+            process_job, store, results_dir, settings.secret, job_id,
+            zip_bytes, policy_obj, redactions_obj,
+            owner=owner, lease_ttl=lease_ttl,
+        )
 
     @app.post("/jobs", status_code=202, response_model=JobCreated)
     def create_job(
@@ -120,21 +174,48 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         secret_fp = settings.secret_fp
         job_id = compute_job_id(input_sha256, policy_obj, redactions_obj, secret_fp)
         existing = store.find_scoped(job_id, secret_fp)
-        if existing:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "job_id": job_id,
-                    "status": existing["status"],
-                    "status_url": f"/jobs/{job_id}",
-                    "detail": "identical submission already exists; returning the existing job",
-                },
+        if existing is None:
+            # New job: persist the input first (atomically) so a crash can
+            # never leave a row whose input is unrecoverable, then register
+            # the row together with this process's execution lease.
+            write_input_atomic(inputs_dir, job_id, content)
+            owner = new_owner_token()
+            created = store.create(
+                job_id, policy_obj, redactions_obj, input_sha256, secret_fp,
+                lease_owner=owner, lease_expires_at=time.time() + lease_ttl,
             )
-        store.create(job_id, policy_obj, redactions_obj, input_sha256, secret_fp)
-        background_tasks.add_task(
-            process_job, store, results_dir, settings.secret, job_id, content, policy_obj, redactions_obj
+            if created:
+                schedule(job_id, owner, content, policy_obj, redactions_obj, background_tasks)
+                return JobCreated(job_id=job_id, status="queued", status_url=f"/jobs/{job_id}")
+            # Concurrent first submission in another process won the insert;
+            # fall through and treat the job as existing.
+            existing = store.find_scoped(job_id, secret_fp)
+            if existing is None:
+                # The id is taken by a row outside this secret scope: a
+                # truncated-id collision, not a legitimate duplicate.
+                raise HTTPException(409, "job id conflict with an existing job")
+
+        if existing["status"] in RESUMABLE_STATUSES:
+            # Unfinished job: recover it in place if no live executor holds
+            # the lease. The atomic claim is the cross-process arbitration;
+            # whoever wins re-executes with inputs taken from the record (the
+            # resubmitted ZIP is verified against the recorded hash), so the
+            # job keeps its original id and produces the complete result.
+            owner = new_owner_token()
+            if store.claim(job_id, owner, time.time() + lease_ttl):
+                recovered = recover_claimed_record(store, existing, owner, content)
+                if recovered is not None:
+                    zip_bytes, rec_policy, rec_redactions = recovered
+                    schedule(job_id, owner, zip_bytes, rec_policy, rec_redactions, background_tasks)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "job_id": job_id,
+                "status": existing["status"],
+                "status_url": f"/jobs/{job_id}",
+                "detail": "identical submission already exists; returning the existing job",
+            },
         )
-        return JobCreated(job_id=job_id, status="queued", status_url=f"/jobs/{job_id}")
 
     @app.get("/jobs/{job_id}", response_model=JobStatus)
     def get_job(job_id: str):

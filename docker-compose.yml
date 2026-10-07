@@ -9,6 +9,10 @@ services:
       # Change for real deployments; keep it stable to keep mappings stable.
       ANON_SECRET: ${ANON_SECRET:-change-me-in-production}
       DATA_DIR: /data
+      # Lease TTL (seconds) for interrupted-job recovery: an executor renews
+      # its lease at TTL/3 intervals; a job whose lease expired (crashed
+      # executor) is taken over on resubmission / at startup. See README.
+      LEASE_TTL_SECONDS: ${LEASE_TTL_SECONDS:-30}
     volumes:
       - dicom-anon-data:/data
     restart: unless-stopped

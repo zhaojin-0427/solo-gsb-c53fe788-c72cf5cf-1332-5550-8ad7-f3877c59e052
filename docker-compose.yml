@@ -1,0 +1,22 @@
+services:
+  api:
+    build: .
+    image: dicom-anon-api
+    ports:
+      - "8000:8000"
+    environment:
+      # HMAC secret behind UID mapping / date shifting / value hashing.
+      # Change for real deployments; keep it stable to keep mappings stable.
+      ANON_SECRET: ${ANON_SECRET:-change-me-in-production}
+      DATA_DIR: /data
+    volumes:
+      - dicom-anon-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  dicom-anon-data:

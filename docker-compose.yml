@@ -9,6 +9,10 @@ services:
       # Change for real deployments; keep it stable to keep mappings stable.
       ANON_SECRET: ${ANON_SECRET:-change-me-in-production}
       DATA_DIR: /data
+      # Crash-recovery tuning (optional): how long an executor's lease on a
+      # job stays valid without a heartbeat, and how often it heartbeats.
+      # JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-30}
+      # JOB_HEARTBEAT_SECONDS: ${JOB_HEARTBEAT_SECONDS:-10}
     volumes:
       - dicom-anon-data:/data
     restart: unless-stopped

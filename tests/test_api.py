@@ -4,8 +4,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import socket
+import subprocess
+import sys
+import time
 import zipfile
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +24,7 @@ from app.dicom_ops import UIDMapper, compute_offset
 from app.engine import anonymize_zip
 from app.main import compute_job_id, create_app
 from app.policy import canonical_json
+from app.store import JobStore
 
 SECRET = "test-secret"
 SECRET_B = "rotated-secret"
@@ -921,3 +928,368 @@ def test_healthz_and_policies(client):
     policies = client.get("/policies").json()
     assert policies["supported_versions"] == ["1.0"]
     assert "empty" in policies["default_profile"]
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery: interrupted jobs resume on resubmission
+# ---------------------------------------------------------------------------
+def plant_interrupted_job(
+    tmp_path,
+    content,
+    policy,
+    redactions=None,
+    *,
+    status="queued",
+    lease_expires=None,
+    owner="dead-worker-1",
+):
+    """Simulate a job record left behind by a process that died mid-flight.
+
+    The record is written exactly as the live API would have written it up to
+    the point of the crash: queued (created but never picked up) or processing
+    (executor started, then vanished), with the dead worker's lease attached.
+    """
+    store = JobStore(str(tmp_path / "jobs.db"))
+    input_sha256 = hashlib.sha256(content).hexdigest()
+    fp = secret_fingerprint(SECRET)
+    job_id = compute_job_id(input_sha256, policy, redactions, fp)
+    assert store.create_if_absent(
+        job_id, policy, redactions, input_sha256, fp, owner, time.time() + 30
+    )
+    if status == "processing":
+        assert store.begin_processing(
+            job_id, owner, lease_expires if lease_expires is not None else time.time() + 30
+        )
+    return job_id
+
+
+def resubmit(tmp_path, payload, policy, redactions=None):
+    """Start a fresh service instance on the same data dir and resubmit."""
+    app = create_app(Settings(data_dir=str(tmp_path), secret=SECRET))
+    client = TestClient(app)
+    data = {"policy": json.dumps(policy)}
+    if redactions is not None:
+        data["redactions"] = json.dumps(redactions)
+    response = client.post(
+        "/jobs",
+        files={"file": ("input.zip", payload, "application/zip")},
+        data=data,
+    )
+    return client, response
+
+
+def test_interrupted_queued_job_resumed_on_resubmit(tmp_path):
+    """Process died after recording the job but before executing it."""
+    payload = three_instance_zip()
+    job_id = plant_interrupted_job(tmp_path, payload, BASE_POLICY, status="queued")
+
+    client, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == job_id  # original id is reused
+    assert "resumed" in body["detail"]
+
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    result = download(client, job_id)
+    assert hashlib.sha256(result).hexdigest() == status["result"]["sha256"]
+    # the resumed run produces exactly what an uninterrupted run would
+    errors, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+    assert errors == []
+    assert result == expected
+
+
+def test_interrupted_processing_job_resumed_after_lease_expiry(tmp_path):
+    """Process died mid-execution; its lease has lapsed by resubmit time."""
+    payload = three_instance_zip()
+    job_id = plant_interrupted_job(
+        tmp_path, payload, BASE_POLICY, status="processing", lease_expires=time.time() - 5
+    )
+
+    client, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    _, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+    assert download(client, job_id) == expected
+
+
+def test_restart_invalidates_previous_instance_leases(tmp_path):
+    """A fresh service instance on the same DATA_DIR may claim the previous
+    instance's in-flight jobs immediately, without waiting out the lease."""
+    payload = three_instance_zip()
+    # lease still "fresh" (would only expire far in the future) ...
+    job_id = plant_interrupted_job(
+        tmp_path, payload, BASE_POLICY, status="processing", lease_expires=time.time() + 3600
+    )
+    # ... but the resubmit goes to a *new* service instance (restart), which
+    # invalidates the dead instance's leases at startup
+    client, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    assert get_job(client, job_id)["status"] == "done"
+
+
+def test_active_job_with_fresh_lease_is_not_taken_over(tmp_path):
+    """A live executor's job must not be reclaimed by a resubmission."""
+    payload = three_instance_zip()
+    app = create_app(Settings(data_dir=str(tmp_path), secret=SECRET))
+    client = TestClient(app)
+    # plant the record *after* app startup so the startup invalidation does
+    # not touch it: this simulates another live instance mid-execution
+    job_id = plant_interrupted_job(
+        tmp_path, payload, BASE_POLICY, status="processing", lease_expires=time.time() + 300
+    )
+
+    response = client.post(
+        "/jobs",
+        files={"file": ("input.zip", payload, "application/zip")},
+        data={"policy": json.dumps(BASE_POLICY)},
+    )
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    # not claimed, not re-executed: still processing under the original owner
+    assert get_job(client, job_id)["status"] == "processing"
+    record = JobStore(str(tmp_path / "jobs.db")).get(job_id)
+    assert record["lease_owner"] == "dead-worker-1"
+    assert record["lease_expires"] > time.time()
+
+
+def test_resumed_job_runs_with_recorded_inputs(tmp_path):
+    """The takeover executes exactly what the record describes: the persisted
+    policy/redactions plus the freshly uploaded (hash-verified) ZIP bytes."""
+    files = {"img.dcm": make_dcm("1.9.1", "1.9.2", "1.9.3", rows=64, cols=64, pixel_value=200)}
+    payload = make_zip(files)
+    redactions = [{"scope": "instance", "uid": "1.9.3", "boxes": [[10, 10, 20, 20]], "fill": 0}]
+    job_id = plant_interrupted_job(tmp_path, payload, BASE_POLICY, redactions, status="queued")
+
+    client, response = resubmit(tmp_path, payload, BASE_POLICY, redactions)
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    status = get_job(client, job_id)
+    assert status["status"] == "done"
+    assert status["audit"]["summary"]["redaction_boxes_applied"] == 1
+    (ds,) = read_output_instances(download(client, job_id)).values()
+    assert ds.PixelData[10 * 64 + 10] == 0  # redaction box was applied
+    assert ds.PixelData[0] == 200
+
+
+def test_resubmit_with_mismatched_input_is_rejected(tmp_path):
+    """A record whose stored input hash does not match the uploaded bytes must
+    never be resumed with those bytes (truncated-id collision defense)."""
+    payload = three_instance_zip()
+    job_id = plant_interrupted_job(tmp_path, payload, BASE_POLICY, status="queued")
+    store = JobStore(str(tmp_path / "jobs.db"))
+    with store._conn:
+        store._conn.execute(
+            "UPDATE jobs SET input_sha256 = ? WHERE job_id = ?", ("0" * 64, job_id)
+        )
+
+    _, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 409
+    # and the job was not executed with the wrong input
+    assert JobStore(str(tmp_path / "jobs.db")).get(job_id)["status"] == "queued"
+
+
+def test_interrupted_result_write_leaves_no_partial_output(tmp_path):
+    """A crash during result publication must not expose a half-written file:
+    the stale temp file is cleaned up and the resumed job downloads complete."""
+    payload = three_instance_zip()
+    job_id = plant_interrupted_job(
+        tmp_path, payload, BASE_POLICY, status="processing", lease_expires=time.time() - 5
+    )
+    results_dir = tmp_path / "results"
+    results_dir.mkdir(exist_ok=True)
+    stale_tmp = results_dir / f".{job_id}.1234.tmp"
+    stale_tmp.write_bytes(b"half-written-result")
+
+    client, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 200
+    assert get_job(client, job_id)["status"] == "done"
+    _, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+    assert download(client, job_id) == expected
+    assert not stale_tmp.exists()  # cleaned up at startup
+    # the only artifact at the download path is the complete file
+    assert (results_dir / f"{job_id}.zip").read_bytes() == expected
+
+
+def test_failed_job_resubmission_keeps_existing_semantics(tmp_path):
+    """A terminally failed job is not re-executed on resubmission."""
+    payload = make_zip({"bad.dcm": make_dcm("1.24.1", "1.24.2", "1.24.3", study_date="20201340")})
+    app = create_app(Settings(data_dir=str(tmp_path), secret=SECRET))
+    client = TestClient(app)
+    job_id = submit(client, payload, BASE_POLICY)
+    assert get_job(client, job_id)["status"] == "failed"
+
+    response = client.post(
+        "/jobs",
+        files={"file": ("input.zip", payload, "application/zip")},
+        data={"policy": json.dumps(BASE_POLICY)},
+    )
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    assert response.json()["status"] == "failed"
+    assert get_job(client, job_id)["status"] == "failed"
+
+
+def test_old_database_is_migrated_with_lease_columns(tmp_path):
+    """A SQLite file created by the pre-lease schema gains the lease columns,
+    and its orphaned queued row (NULL lease) becomes claimable on resubmit."""
+    import sqlite3
+
+    payload = three_instance_zip()
+    input_sha256 = hashlib.sha256(payload).hexdigest()
+    fp = secret_fingerprint(SECRET)
+    job_id = compute_job_id(input_sha256, BASE_POLICY, None, fp)
+
+    db_path = str(tmp_path / "jobs.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT,"
+        " updated_at TEXT, policy_json TEXT NOT NULL, redactions_json TEXT, input_sha256 TEXT,"
+        " result_path TEXT, result_sha256 TEXT, audit_json TEXT, errors_json TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO jobs VALUES (?, 'queued', 't', 't', ?, NULL, ?, NULL, NULL, NULL, NULL)",
+        (job_id, json.dumps(BASE_POLICY), input_sha256),
+    )
+    conn.commit()
+    conn.close()
+
+    # pre-lease rows have no secret fingerprint, so scoped dedup cannot match
+    # them; attach the current scope as the rotation-aware writer would have
+    store = JobStore(db_path)
+    assert store.get(job_id)["lease_owner"] is None
+    with store._conn:
+        store._conn.execute("UPDATE jobs SET secret_fp = ? WHERE job_id = ?", (fp, job_id))
+
+    client, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    assert get_job(client, job_id)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery across a real process restart (SIGKILL -> restart -> resume)
+# ---------------------------------------------------------------------------
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_ready(port: int, timeout: float = 30.0) -> None:
+    import httpx
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=2).status_code == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError("server did not become ready")
+
+
+def _start_server(data_dir, port, secret):
+    env = dict(
+        os.environ,
+        DATA_DIR=str(data_dir),
+        ANON_SECRET=secret,
+        JOB_LEASE_SECONDS="5",
+        JOB_HEARTBEAT_SECONDS="1",
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        env=env,
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.parametrize("instances", [150])
+def test_crash_recovery_across_process_restart(tmp_path, instances):
+    """End to end: SIGKILL the server mid-job, restart on the same DATA_DIR
+    and ANON_SECRET, resubmit verbatim, and get a complete downloadable result
+    under the original job id."""
+    import httpx
+
+    files = {
+        f"inst/{i:04d}.dcm": make_dcm("9.9.1", "9.9.2", f"9.9.3.{i}", instance_number=i)
+        for i in range(instances)
+    }
+    payload = make_zip(files)
+    port = _free_port()
+
+    proc = _start_server(tmp_path / "data", port, SECRET)
+    try:
+        _wait_ready(port)
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+            timeout=60,
+        )
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+        # resubmitting while the job is actively running reuses the job
+        # (HTTP 200) and does not spawn a competing execution
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+            timeout=60,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["job_id"] == job_id
+        # the job must be in flight (not finished) when we kill the server
+        status = httpx.get(f"http://127.0.0.1:{port}/jobs/{job_id}", timeout=5).json()
+        assert status["status"] in ("queued", "processing"), status
+    finally:
+        proc.kill()
+        proc.wait()
+
+    proc = _start_server(tmp_path / "data", port, SECRET)
+    try:
+        _wait_ready(port)
+        # verbatim resubmission: same id, and the interrupted job is resumed
+        resp = httpx.post(
+            f"http://127.0.0.1:{port}/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+            timeout=60,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["job_id"] == job_id
+
+        deadline = time.time() + 90
+        while True:
+            status = httpx.get(f"http://127.0.0.1:{port}/jobs/{job_id}", timeout=5).json()
+            if status["status"] == "done":
+                break
+            assert status["status"] in ("queued", "processing"), status
+            assert time.time() < deadline, "job did not recover in time"
+            time.sleep(0.5)
+
+        dl = httpx.get(f"http://127.0.0.1:{port}/jobs/{job_id}/download", timeout=30)
+        assert dl.status_code == 200
+        assert hashlib.sha256(dl.content).hexdigest() == status["result"]["sha256"]
+        # byte-identical to what an uninterrupted run would have produced
+        errors, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+        assert errors == []
+        assert dl.content == expected
+    finally:
+        proc.kill()
+        proc.wait()

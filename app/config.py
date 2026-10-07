@@ -37,6 +37,13 @@ def secret_fingerprint(secret: str) -> str:
 class Settings:
     data_dir: str
     secret: str
+    #: Seconds an executor's lease on a job stays valid without a heartbeat.
+    #: A crashed executor stops heartbeating, so its queued/processing jobs
+    #: become claimable once the lease lapses (or immediately after a restart,
+    #: which invalidates the previous instance's leases outright).
+    lease_seconds: float = 30.0
+    #: Interval between lease renewals while a job runs.
+    heartbeat_seconds: float = 10.0
 
     @property
     def secret_fp(self) -> str:
@@ -44,7 +51,11 @@ class Settings:
 
 
 def get_settings() -> Settings:
+    lease = float(os.environ.get("JOB_LEASE_SECONDS", "30"))
+    heartbeat = float(os.environ.get("JOB_HEARTBEAT_SECONDS", str(lease / 3)))
     return Settings(
         data_dir=os.environ.get("DATA_DIR", "./data"),
         secret=os.environ.get("ANON_SECRET", DEFAULT_SECRET),
+        lease_seconds=lease,
+        heartbeat_seconds=heartbeat,
     )

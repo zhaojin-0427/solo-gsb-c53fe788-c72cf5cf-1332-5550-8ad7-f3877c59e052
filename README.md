@@ -28,6 +28,10 @@
 - **幂等提交**：相同输入 + 策略 + 遮挡规则在**同一 `ANON_SECRET` 作用域下**
   的重复提交返回同一作业（HTTP 200）；轮换密钥后重提会创建独立作业，
   绝不会把旧密钥的结果当作新密钥的结果返回。
+- **中断自愈**：进程在作业完成前退出（崩溃/重启）后，原样重提即以**原
+  作业 ID** 恢复执行并产出完整可下载结果。执行租约 + 心跳区分活跃与
+  死亡执行者，SQLite 条件更新跨进程原子裁决接管权，结果文件原子写入，
+  绝不暴露半成品或误标完成。详见[「中断恢复」](#中断恢复崩溃一致性)。
 - **密钥作用域（轮换安全）**：判重 ID 与持久化判重条件都带密钥**指纹**
   （SHA-256 截断，非可逆，不保存明文密钥）。旧密钥作业仍可用原 ID 查询下载，
   新密钥产出独立作业 ID、审计与哈希；升级前的无指纹旧记录自动迁移且永不被复用。
@@ -45,12 +49,17 @@ docker compose up --build
 - 策略说明：`GET /policies`
 
 作业数据库与结果 ZIP 持久化在命名卷 `dicom-anon-data`（容器内 `/data`），
-重启容器不会丢失历史作业。
+重启容器不会丢失历史作业；重启后原样重提中断的作业即可恢复执行
+（见[「中断恢复」](#中断恢复崩溃一致性)）。
 
 > 生产部署请设置稳定的 `ANON_SECRET`（环境变量或 `.env` 文件），
 > 它是 UID 映射 / 日期偏移 / 哈希的 HMAC 根密钥；变更后映射结果会改变。
 > 密钥如何参与判重、轮换后会发生什么，见下文
 > [「密钥轮换与判重作用域」](#密钥轮换与判重作用域)。
+>
+> 可选环境变量：`JOB_LEASE_SECONDS`（作业执行租约时长，默认 30）、
+> `JOB_HEARTBEAT_SECONDS`（执行中续租间隔，默认租约的 1/3）。
+> 二者决定崩溃的作业多快可被接管恢复，见[「中断恢复」](#中断恢复崩溃一致性)。
 
 ## 本地开发
 
@@ -58,7 +67,7 @@ docker compose up --build
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
-pytest tests/ -q          # 36 项测试
+pytest tests/ -q          # 46 项测试
 ```
 
 ## 示例请求
@@ -279,6 +288,98 @@ curl -s http://localhost:8000/jobs/218b2ae74856eadbd34f8504f8e4521f/download \
   | sha256sum
 # be0c34e6278075de3a1afd598e16b0696d0e0076d885ae20bd79b3db55781707  -
 ```
+
+## 中断恢复（崩溃一致性）
+
+作业的执行完全由进程内后台任务承载，输入 ZIP 字节不落盘（只留 SHA-256）。
+旧版本里，若进程在 `queued`/`processing` 期间退出，后台任务随之消失，
+而重提只会判重返回 200——作业永远卡住。本版本把执行权显式建模为
+**租约（lease）**，使中断的作业可以安全恢复：
+
+- **执行租约**：每条作业记录携带 `lease_owner`（服务实例标识）与
+  `lease_expires`。执行中的作业由心跳线程周期性续租
+  （`JOB_HEARTBEAT_SECONDS`，默认 10s；租约时长 `JOB_LEASE_SECONDS`，
+  默认 30s）。进程死亡则心跳停止，租约自然过期。
+- **启动时作废旧租约**：本服务按单实例部署（一个 `DATA_DIR` 对应一个
+  活跃服务实例）。新进程启动时把上一实例遗留的全部在途租约作废，
+  因此重启后的**第一次重提即可立即接管**，无需等待租约超时。
+- **跨进程原子裁决**：接管通过单条 SQLite 条件 `UPDATE`
+  （`status='queued'` 或 `processing` 且租约已过期才更新 owner）完成；
+  SQLite 串行化并发写，多个进程同时接管时**恰好一个成功**。执行开始前
+  与标记完成/失败时也都以租约为条件，已被接管方的过期执行会自动放弃。
+- **接管输入与记录一致**：重提时先核对上传 ZIP 的 SHA-256 与记录中的
+  `input_sha256`（不一致返回 409，绝不拿错输入）；执行使用记录中持久化
+  的策略与遮挡规则，ZIP 字节取自本次上传（记录本就不存输入字节）。
+- **结果原子发布**：结果先写临时文件、fsync、再原子 rename 到下载路径，
+  文件完整落盘后才把状态置为 `done`。崩溃只会留下不可见的临时文件
+  （下次启动自动清理），绝不会暴露半成品或误标 `done`。
+- **确定性重放**：输出字节由输入 + 策略 + 密钥唯一决定，恢复执行的
+  结果与不中断的执行逐字节一致。
+
+不同状态下原样重提（同一 `DATA_DIR` + 同一 `ANON_SECRET`）的行为：
+
+| 现有状态 | 含义 | 重提行为 |
+| --- | --- | --- |
+| `queued`（无活跃执行者） | 进程在调度前退出 | 接管并恢复执行（200） |
+| `processing` + 租约过期/已作废 | 进程在执行中退出 | 接管并恢复执行（200） |
+| `processing` + 租约有效 | 作业正在活跃执行 | 不接管，返回既有作业（200） |
+| `done` / `failed` | 终态 | 复用既有结果/错误（200），不重复执行 |
+
+### 实操：Docker Compose 下验证一次中断恢复
+
+用一个 300 实例的输入让作业运行数秒，以便在处理中杀掉容器：
+
+```bash
+docker compose up --build -d
+python scripts/make_sample.py big_input.zip --instances 300
+
+curl -s -X POST http://localhost:8000/jobs \
+  -F "file=@big_input.zip" \
+  -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+# {"job_id":"0a74c131a679cc3a7bf9a38e6ab7a08f","status":"queued", ...}
+
+curl -s http://localhost:8000/jobs/0a74c131a679cc3a7bf9a38e6ab7a08f
+# { "job_id": "0a74c131a679cc3a7bf9a38e6ab7a08f", "status": "processing", ... }
+
+docker compose kill        # 模拟崩溃：进程在执行中退出
+docker compose up -d       # 同一数据卷、同一 ANON_SECRET 重启
+```
+
+原样重提：判重命中既有记录（HTTP 200，同一 `job_id`），服务发现旧执行者
+已不在，原子接管并以原 ID 恢复执行：
+
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:8000/jobs \
+  -F "file=@big_input.zip" \
+  -F "policy=<examples/policy.json" \
+  -F "redactions=<examples/redactions.json"
+# {"job_id":"0a74c131a679cc3a7bf9a38e6ab7a08f","status":"processing",
+#  "status_url":"/jobs/0a74c131a679cc3a7bf9a38e6ab7a08f",
+#  "detail":"existing job was interrupted; execution resumed under the original job id"}
+# HTTP 200
+```
+
+轮询直至完成后下载复验（以下为上述步骤实跑采集）：
+
+```bash
+curl -s http://localhost:8000/jobs/0a74c131a679cc3a7bf9a38e6ab7a08f
+# { "job_id": "0a74c131a679cc3a7bf9a38e6ab7a08f", "status": "done",
+#   "secret_fingerprint": "037e11597df47b747293d41a7942a87a",
+#   "audit": { "summary": { "studies": 1, "series": 2, "instances": 300, ... }, ... },
+#   "result": { "sha256": "342902e9db4f602d19ceef71884989b4c12e7c8556c1158234cd403396abdc64",
+#               "size_bytes": 1163206,
+#               "download_url": "/jobs/0a74c131a679cc3a7bf9a38e6ab7a08f/download" } }
+
+curl -s -OJ http://localhost:8000/jobs/0a74c131a679cc3a7bf9a38e6ab7a08f/download
+sha256sum anonymized-0a74c131a679cc3a7bf9a38e6ab7a08f.zip
+# 342902e9db4f602d19ceef71884989b4c12e7c8556c1158234cd403396abdc64  —— 与 result.sha256 一致
+```
+
+> 多实例部署提示：租约作废基于「一个 `DATA_DIR` 一个活跃实例」的模型。
+> 请勿让两个服务实例共享同一 `DATA_DIR` 长期并存；滚动重启（新实例起来
+> 旧实例即退）是安全的——最坏情况只是同一作业被确定性重放一次，结果
+> 字节相同。
 
 ## 匿名化策略（版本化）
 
